@@ -3,16 +3,16 @@ import sys
 import glob
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtWidgets, QtGui
 import pyqtgraph as pg
 
 
 @dataclass
 class Config:
     watch_folder: str = ""
-    file_glob: str = "*.txt"          # adjust if needed: "*.txt" etc.
+    file_glob: str = "*.txt"          # adjust if needed: "*.A21" etc.
     poll_ms: int = 1000
 
     delimiter: str = "\t"
@@ -21,58 +21,42 @@ class Config:
     date_col: str = "Date"
     start_time_col: str = "Start Time"
     concentration_col: str = "Total Conc."
-    median_col: str = "Median(µm)"    # you can set Median(um) too; normalization handles both
+    median_col: str = "Median(µm)"    # normalization handles Median(um)/Median(μm)/Median(Âµm) too
 
     date_format: str = "%m/%d/%y"
     time_format: str = "%H:%M:%S"
 
+    # Font sizes
+    ui_font_pt: int = 11
+    axis_tick_font_pt: int = 11
+    axis_label_font_pt: int = 12
+
 
 def read_text_with_fallback(path: str):
-    """
-    Try a few encodings commonly seen in instrument files.
-    Returns (text, encoding_used).
-    """
     encodings = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
-    last_err = None
     for enc in encodings:
         try:
             with open(path, "r", encoding=enc, errors="strict") as f:
                 return f.read(), enc
-        except Exception as e:
-            last_err = e
+        except Exception:
             continue
-    # last resort: replace
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         return f.read(), "utf-8(replace)"
 
 
 def normalize_col_name(s: str) -> str:
-    """
-    Normalize column names so we can match headers despite:
-    - spaces/punctuation
-    - µ vs μ vs u
-    - 'Âµ' artifact (common when UTF-8 is mis-decoded as cp1252)
-    """
     if s is None:
         return ""
     s = str(s).strip()
-
-    # common garbage artifacts
     s = s.replace("\ufeff", "")      # BOM
     s = s.replace("Âµ", "u").replace("Âμ", "u")
     s = s.replace("µ", "u").replace("μ", "u")
-
     s = s.lower()
     s = re.sub(r"[^a-z0-9]+", "", s)
     return s
 
 
 def parse_number_with_units(s: str):
-    """
-    Extract numeric value from strings like:
-      '4.65591(#/cm³)' -> 4.65591
-      '-1.#IND'        -> None
-    """
     if s is None:
         return None
     s = str(s).strip()
@@ -115,24 +99,57 @@ def find_latest_file(cfg: Config):
     return files[0]
 
 
+def format_hms(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    total = seconds
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+class DualTimeAxis(pg.AxisItem):
+    """
+    Bottom axis shows:
+      Line 1: absolute time (HH:MM:SS)
+      Line 2: elapsed since start (HH:MM:SS)
+    Axis values are POSIX timestamps (float seconds).
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.base_ts: float | None = None
+
+    def set_base_timestamp(self, base_ts: float | None):
+        self.base_ts = base_ts
+        self.picture = None
+        self.update()
+
+    def tickStrings(self, values, scale, spacing):
+        out = []
+        for v in values:
+            try:
+                abs_str = datetime.fromtimestamp(v).strftime("%H:%M:%S")
+            except Exception:
+                abs_str = ""
+            if self.base_ts is None:
+                out.append(abs_str)
+            else:
+                out.append(f"{abs_str}\n{format_hms(v - self.base_ts)}")
+        return out
+
+
 def load_full_run(path: str, cfg: Config):
-    """
-    Returns:
-      tvals, conc_vals, median_vals, info_dict
-    """
     if not path or not os.path.exists(path):
-        return [], [], [], {"error": "File not found"}
+        return [], [], [], {"error": "File not found"}, None
 
     text, enc_used = read_text_with_fallback(path)
     lines = text.splitlines()
 
     if len(lines) <= cfg.metadata_lines:
-        return [], [], [], {"error": "File too short", "encoding": enc_used}
+        return [], [], [], {"error": "File too short", "encoding": enc_used}, None
 
-    # skip metadata
     data_lines = lines[cfg.metadata_lines:]
 
-    # header
     header_line = data_lines[0]
     header = [h.strip() for h in header_line.split(cfg.delimiter)]
     norm_to_idx = {normalize_col_name(h): i for i, h in enumerate(header)}
@@ -154,12 +171,11 @@ def load_full_run(path: str, cfg: Config):
 
     if time_i is None or conc_i is None:
         info["error"] = "Missing required columns (Start Time / Total Conc.)"
-        return [], [], [], info
+        return [], [], [], info, None
 
-    tvals, conc_vals, median_vals = [], [], []
+    x_ts, conc_vals, median_vals = [], [], []
     base_dt = None
 
-    # rows start after header
     for line in data_lines[1:]:
         if not line.strip():
             continue
@@ -181,19 +197,18 @@ def load_full_run(path: str, cfg: Config):
             dt = parse_datetime(parts[date_i], parts[time_i], cfg)
 
         if dt is None:
-            elapsed = len(tvals)
-        else:
             if base_dt is None:
-                base_dt = dt
-            elapsed = (dt - base_dt).total_seconds()
-            if elapsed < 0:
-                continue
+                base_dt = datetime.now()
+            dt = base_dt + timedelta(seconds=len(x_ts))
 
-        tvals.append(elapsed)
+        if base_dt is None:
+            base_dt = dt
+
+        x_ts.append(dt.timestamp())
         conc_vals.append(conc)
         median_vals.append(float("nan") if med is None else med)
 
-    return tvals, conc_vals, median_vals, info
+    return x_ts, conc_vals, median_vals, info, base_dt
 
 
 class LiveTailReader:
@@ -215,15 +230,9 @@ class LiveTailReader:
         if not os.path.exists(self.path):
             return
 
-        text, enc_used = read_text_with_fallback(self.path)
+        _, enc_used = read_text_with_fallback(self.path)
         self.encoding_used = enc_used
-        lines = text.splitlines(True)
 
-        # find header line after metadata
-        if len(lines) <= self.cfg.metadata_lines:
-            return
-
-        # compute byte offset by re-reading with same encoding
         with open(self.path, "r", encoding=enc_used.replace("(replace)", ""), errors="replace") as f:
             for _ in range(self.cfg.metadata_lines):
                 f.readline()
@@ -256,9 +265,7 @@ class LiveTailReader:
         if not os.path.exists(self.path):
             return []
 
-        # use same encoding as header init if possible
-        enc = self.encoding_used or "utf-8"
-        enc = enc.replace("(replace)", "")
+        enc = (self.encoding_used or "utf-8").replace("(replace)", "")
 
         try:
             with open(self.path, "r", encoding=enc, errors="replace") as f:
@@ -299,8 +306,13 @@ class LivePlotWindow(QtWidgets.QMainWindow):
         self.cfg = cfg
         self.settings = QtCore.QSettings("YourLab", "ConcentrationMonitor")
 
+        # Bigger UI font
+        app_font = QtGui.QFont()
+        app_font.setPointSize(self.cfg.ui_font_pt)
+        QtWidgets.QApplication.instance().setFont(app_font)
+
         self.setWindowTitle("Concentration + Median Monitor")
-        self.resize(1100, 720)
+        self.resize(1180, 780)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -323,6 +335,14 @@ class LivePlotWindow(QtWidgets.QMainWindow):
         self.load_full_btn.clicked.connect(self.load_full_now)
         top.addWidget(self.load_full_btn)
 
+        self.follow_btn = QtWidgets.QPushButton("Follow")
+        self.follow_btn.clicked.connect(self.follow_only)
+        top.addWidget(self.follow_btn)
+
+        self.reset_follow_btn = QtWidgets.QPushButton("Reset + Follow")
+        self.reset_follow_btn.clicked.connect(self.reset_and_follow)
+        top.addWidget(self.reset_follow_btn)
+
         self.pause_btn = QtWidgets.QPushButton("Pause")
         self.pause_btn.setCheckable(True)
         self.pause_btn.toggled.connect(self.on_pause_toggled)
@@ -334,17 +354,40 @@ class LivePlotWindow(QtWidgets.QMainWindow):
         self.autoscale_btn.toggled.connect(self.on_autoscale_toggled)
         top.addWidget(self.autoscale_btn)
 
-        # Plot
-        self.plot = pg.PlotWidget()
+        # Plot with custom time axis
+        self.time_axis = DualTimeAxis(orientation="bottom")
+        self.plot = pg.PlotWidget(axisItems={"bottom": self.time_axis})
         self.plot.showGrid(x=True, y=True, alpha=0.2)
-        self.plot.setLabel("bottom", "Elapsed time", units="s")
+        self.plot.setLabel("bottom", "Time (Start / Elapsed)")
         self.plot.setLabel("left", "Total Conc.", units="#/cm³")
         layout.addWidget(self.plot)
+
+        # Bigger axis fonts
+        tick_font = QtGui.QFont()
+        tick_font.setPointSize(self.cfg.axis_tick_font_pt)
+
+        label_font = QtGui.QFont()
+        label_font.setPointSize(self.cfg.axis_label_font_pt)
+        label_font.setBold(True)
+
+        for name in ("left", "bottom", "right"):
+            ax = self.plot.getAxis(name)
+            try:
+                ax.setTickFont(tick_font)
+            except Exception:
+                try:
+                    ax.setStyle(tickFont=tick_font)
+                except Exception:
+                    pass
+            try:
+                ax.label.setFont(label_font)
+            except Exception:
+                pass
 
         # Left curve
         self.conc_curve = self.plot.plot([], [], pen=pg.mkPen(width=2))
 
-        # Right axis + ViewBox
+        # Right axis + ViewBox (median, blue)
         self.plot.showAxis("right")
         right_axis = self.plot.getAxis("right")
         right_axis.setLabel("Median", units="um")
@@ -359,13 +402,19 @@ class LivePlotWindow(QtWidgets.QMainWindow):
         self.median_curve = pg.PlotCurveItem([], [], pen=pg.mkPen("b", width=2))
         self.median_vb.addItem(self.median_curve)
 
-        # Keep the two viewboxes aligned
+        # Keep viewboxes aligned
         main_vb = self.plot.getViewBox()
         main_vb.sigResized.connect(self.update_views)
         main_vb.sigRangeChanged.connect(lambda *_: self.update_views())
         QtCore.QTimer.singleShot(0, self.update_views)
 
-        self.t, self.conc, self.median = [], [], []
+        # Follow logic
+        self.follow_enabled = True
+        if hasattr(main_vb, "sigRangeChangedManually"):
+            main_vb.sigRangeChangedManually.connect(self._on_user_changed_view)
+
+        # Data
+        self.x_ts, self.conc, self.median = [], [], []
         self.current_file = None
         self.reader = None
         self.base_dt = None
@@ -381,6 +430,9 @@ class LivePlotWindow(QtWidgets.QMainWindow):
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(self.cfg.poll_ms)
+
+    def _on_user_changed_view(self, *args, **kwargs):
+        self.follow_enabled = False
 
     def update_views(self):
         vb = self.plot.getViewBox()
@@ -413,9 +465,11 @@ class LivePlotWindow(QtWidgets.QMainWindow):
         self.current_file = None
         self.reader = None
         self.base_dt = None
-        self.t.clear(); self.conc.clear(); self.median.clear()
+        self.time_axis.set_base_timestamp(None)
+        self.x_ts.clear(); self.conc.clear(); self.median.clear()
         self.conc_curve.setData([], [])
         self.median_curve.setData([], [])
+        self.follow_enabled = True
         self.update_views()
 
     def _ensure_file(self):
@@ -436,45 +490,109 @@ class LivePlotWindow(QtWidgets.QMainWindow):
         self.current_file = path
         self.reader = LiveTailReader(path, self.cfg)
         self.base_dt = None
+        self.time_axis.set_base_timestamp(None)
 
-        self.t.clear(); self.conc.clear(); self.median.clear()
+        self.x_ts.clear(); self.conc.clear(); self.median.clear()
         self.conc_curve.setData([], [])
         self.median_curve.setData([], [])
 
+        self.follow_enabled = True
         self.status_label.setText(f"Monitoring: {os.path.basename(path)}")
         return True
+
+    def _current_x_window_width(self) -> float | None:
+        vb = self.plot.getViewBox()
+        (x0, x1), _ = vb.viewRange()
+        width = float(x1 - x0)
+        if width <= 0 or width > 1e12:
+            return None
+        return width
+
+    def apply_follow_view(self, force: bool = False, keep_window: bool = False):
+        """
+        Follow mode behavior:
+          - keep_window=False: show full run so far (x from first to latest)
+          - keep_window=True: keep current x-window width and pan to latest point
+
+        FIXES:
+          - keep_window=True uses padding=0.0 to avoid creeping growth.
+        """
+        if not self.x_ts:
+            return
+        if not (self.follow_enabled or force):
+            return
+
+        latest = self.x_ts[-1]
+        vb = self.plot.getViewBox()
+        vb.enableAutoRange(axis=pg.ViewBox.XAxis, enable=False)
+
+        if keep_window:
+            width = self._current_x_window_width()
+            if width is None:
+                x0 = self.x_ts[0]
+                x1 = latest
+            else:
+                x1 = latest
+                x0 = x1 - width
+                if x0 < self.x_ts[0]:
+                    x0 = self.x_ts[0]
+                    x1 = x0 + width
+
+            # IMPORTANT: no padding for fixed-window follow
+            vb.setXRange(x0, x1, padding=0.0)
+
+        else:
+            x0 = self.x_ts[0]
+            x1 = latest
+            if x1 <= x0:
+                x1 = x0 + 1.0
+            vb.setXRange(x0, x1, padding=0.02)
+
+    def follow_only(self):
+        self.follow_enabled = True
+        self.apply_follow_view(force=True, keep_window=True)
+        self.update_views()
+
+    def reset_and_follow(self):
+        self.follow_enabled = True
+        if self.autoscale_y:
+            self.plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+            self.median_vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+        self.apply_follow_view(force=True, keep_window=False)
+        self.update_views()
 
     def load_full_now(self):
         if not self._ensure_file():
             return
 
-        tvals, conc_vals, median_vals, info = load_full_run(self.current_file, self.cfg)
+        x_ts, conc_vals, median_vals, info, base_dt = load_full_run(self.current_file, self.cfg)
 
-        self.t = tvals
+        self.x_ts = x_ts
         self.conc = conc_vals
         self.median = median_vals
+        self.base_dt = base_dt
 
-        self.conc_curve.setData(self.t, self.conc)
-        self.median_curve.setData(self.t, self.median)
+        if self.base_dt is not None:
+            self.time_axis.set_base_timestamp(self.base_dt.timestamp())
+
+        self.conc_curve.setData(self.x_ts, self.conc)
+        self.median_curve.setData(self.x_ts, self.median)
 
         if self.autoscale_y:
             self.plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
             self.median_vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
 
+        self.apply_follow_view(force=True, keep_window=False)
         self.update_views()
 
-        non_nan = sum(1 for v in self.median if v == v)
-        median_msg = "median: OK" if non_nan > 0 else "median: ALL NaN"
-        match_msg = f"matched='{info.get('median_header_match')}'" if info.get("median_found") else "median column NOT FOUND"
-
         if self.conc:
+            latest_abs = datetime.fromtimestamp(self.x_ts[-1]).strftime("%H:%M:%S")
+            latest_elapsed = format_hms(self.x_ts[-1] - self.x_ts[0])
             self.status_label.setText(
                 f"FULL RUN | {os.path.basename(self.current_file)} | "
-                f"enc={info.get('encoding')} | {match_msg} | {median_msg} | "
-                f"Latest conc: {self.conc[-1]:.4g} | Latest median: {self.median[-1]:.4g}"
+                f"Latest: {latest_abs} ({latest_elapsed}) | "
+                f"Conc: {self.conc[-1]:.4g} | Median: {self.median[-1]:.4g}"
             )
-        else:
-            self.status_label.setText(f"FULL RUN | No valid data. enc={info.get('encoding')}")
 
     def tick(self):
         if self.paused:
@@ -489,6 +607,7 @@ class LivePlotWindow(QtWidgets.QMainWindow):
 
         new_rows = self.reader.read_new_rows()
         if not new_rows:
+            # FIX: No new data -> do nothing. Prevents x-range drifting.
             return
 
         idx = self.reader.col_index
@@ -522,29 +641,32 @@ class LivePlotWindow(QtWidgets.QMainWindow):
 
             if self.base_dt is None:
                 self.base_dt = dt
+                self.time_axis.set_base_timestamp(self.base_dt.timestamp())
 
-            elapsed_s = (dt - self.base_dt).total_seconds()
-            if elapsed_s < 0:
-                continue
-
-            self.t.append(elapsed_s)
+            self.x_ts.append(dt.timestamp())
             self.conc.append(conc_val)
             self.median.append(float("nan") if med_val is None else med_val)
             added += 1
 
         if added:
-            self.conc_curve.setData(self.t, self.conc)
-            self.median_curve.setData(self.t, self.median)
+            self.conc_curve.setData(self.x_ts, self.conc)
+            self.median_curve.setData(self.x_ts, self.median)
 
             if self.autoscale_y:
                 self.plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
                 self.median_vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
 
+            if self.follow_enabled:
+                self.apply_follow_view(keep_window=True)
+
             self.update_views()
 
+            latest_abs = datetime.fromtimestamp(self.x_ts[-1]).strftime("%H:%M:%S")
+            latest_elapsed = format_hms(self.x_ts[-1] - self.x_ts[0])
             self.status_label.setText(
                 f"LIVE | {os.path.basename(self.current_file)} | points={len(self.conc)} | "
-                f"Latest conc: {self.conc[-1]:.4g} | Latest median: {self.median[-1]:.4g}"
+                f"Latest: {latest_abs} ({latest_elapsed}) | "
+                f"Conc: {self.conc[-1]:.4g} | Median: {self.median[-1]:.4g}"
             )
 
 
